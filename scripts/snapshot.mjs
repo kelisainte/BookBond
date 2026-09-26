@@ -1,0 +1,17 @@
+import {execFileSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
+import {readFileSync,writeFileSync,mkdirSync,statSync} from 'node:fs';
+import {join} from 'node:path';
+const raw=process.argv.find(a=>a.startsWith('--label='))?.slice(8)??'release';
+const label=raw.toLowerCase().replace(/[^a-z0-9-]/g,'-').slice(0,35);
+const root=process.cwd(),sha=execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
+const dirty=execFileSync('git',['status','--porcelain'],{cwd:root,encoding:'utf8'}).trim();
+if(dirty) throw Error('Commit every change before creating a recall snapshot');
+const timestamp=new Date().toISOString().replace(/[:.]/g,'-');
+const stem=`${timestamp}-${label}-${sha.slice(0,8)}`,folder=join(root,'.snapshots');mkdirSync(folder,{recursive:true});
+const files=execFileSync('git',['ls-files','-z'],{cwd:root}).toString().split('\0').filter(Boolean);
+const manifest={name:'BookBonds platform recall',label,createdAt:new Date().toISOString(),commit:sha,tag:`recall/${timestamp}-${label}`,files:files.map(path=>({path,bytes:statSync(join(root,path)).size,sha256:createHash('sha256').update(readFileSync(join(root,path))).digest('hex')}))};
+const archive=join(folder,`${stem}.tar.gz`);execFileSync('git',['archive','--format=tar.gz',`--output=${archive}`,'HEAD'],{cwd:root});
+writeFileSync(join(folder,`${stem}.json`),JSON.stringify({...manifest,archive:archive.split('/').pop(),archiveSha256:createHash('sha256').update(readFileSync(archive)).digest('hex')},null,2));
+execFileSync('git',['tag','-a',manifest.tag,'-m',`BookBonds recall ${label} at ${sha}`],{cwd:root});
+console.log(`Created ${archive}\nTag: ${manifest.tag}\nFiles: ${files.length}`);
