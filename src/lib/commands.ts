@@ -240,6 +240,7 @@ export async function command(action:string, payload:Body, user:string) {
         return {saved:true,draftVersion:rows[0].draft_version};
       }
       requireValue((await effectivePolicy(tx,'feature_flags')).roomPublishingEnabled,'Room publishing is temporarily paused',409);
+      requireValue(room.draft_version===z.number().int().min(0).parse(payload.baseVersion),'Room changed before publication. Review the latest draft.',409);
       const audience=enumValue(payload.audience,['public','private'] as const);
       const {rows}=await tx.query('update rooms set published=draft,audience=$2,version=version+1,updated_at=now() where user_id=$1 returning *',[user,audience]);
       await tx.query('insert into room_versions(room_id,version,scene) values($1,$2,$3)',[room.id,rows[0].version,JSON.stringify(room.draft)]);

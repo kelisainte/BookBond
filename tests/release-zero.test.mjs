@@ -40,6 +40,10 @@ test('stale Room writes cannot overwrite a newer draft',async()=>{
     await db.query('insert into room_draft_versions(room_id,version,scene,name,mood) values($1,$2,$3,$4,$5)',[roomId,1,{light:40,objects:[]},'Study','study']);
     const stale=await db.query('update rooms set draft=$2,draft_version=draft_version+1 where user_id=$1 and draft_version=$3 returning draft_version',[user,{light:90,objects:[]},0]);
     assert.equal(stale.rows.length,0);
+    const stalePublish=await db.query('update rooms set published=draft,version=version+1 where user_id=$1 and draft_version=$2 returning version',[user,0]);
+    assert.equal(stalePublish.rows.length,0);
+    const published=await db.query('update rooms set published=draft,version=version+1 where user_id=$1 and draft_version=$2 returning version',[user,1]);
+    assert.equal(published.rows[0].version,1);
     const room=await db.query('select draft,draft_version from rooms where user_id=$1',[user]);
     assert.equal(room.rows[0].draft.light,40);
     assert.equal(room.rows[0].draft_version,1);
