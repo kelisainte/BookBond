@@ -2,6 +2,8 @@
 
 Status vocabulary: **built** means implemented in code and exercised by build/schema checks; **partial** means a functional vertical slice exists but the full policy or workflow is not complete; **gated** means intentionally unavailable pending a real provider, rights, policy or physical process. None implies a live pilot or production certification.
 
+Release-zero repair branch: offer-kind translation, full-journal balances, reading corrections, server-side paginated discovery, shared published 2D Room rendering, revisioned Room drafts/restores and typed effective staff policies are implemented in code. The release still requires migration 003, staging accounts and live transaction verification before production promotion. See `docs/TRACEABILITY.md`.
+
 | Blueprint section | Status | Current implementation and remaining work |
 | --- | --- | --- |
 | 1 Language and boundaries | Built | Work/edition/copy, Bond vs loan vs gift, passport vs Leaflet journal; no simulated money. |

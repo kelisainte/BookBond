@@ -1,27 +1,49 @@
 import { many, one } from './db';
 import { DomainError, requireValue } from './validation';
+import {policyDefaults,validatePolicy} from './policies';
 
 export async function view(scope:string,user:string|null,query:URLSearchParams) {
   const mine=()=>requireValue(user,'Sign in to continue',401);
   if(scope==='public') {
-    const [copies,rooms,circles,counts]=await Promise.all([
+    const policyRows=await many<{key:string;value:unknown}>("select key,value from policies where key in ('discovery','service_notices')");
+    const configured=Object.fromEntries(policyRows.map(p=>[p.key,validatePolicy(p.key as 'discovery'|'service_notices',p.value)]));
+    const discovery=(configured.discovery??policyDefaults.discovery) as typeof policyDefaults.discovery;
+    const notices=(configured.service_notices??policyDefaults.service_notices) as typeof policyDefaults.service_notices;
+    const term=(query.get('q')??'').trim().slice(0,120);
+    const kind=query.get('kind')??'all';
+    requireValue(['all','swap','loan','gift'].includes(kind),'Invalid listing filter');
+    const rawCursor=query.get('cursor');
+    let cursor:{date:string;id:string}|null=null;
+    if(rawCursor) {
+      try { cursor=JSON.parse(Buffer.from(rawCursor,'base64url').toString('utf8')); }
+      catch { throw new DomainError('Invalid page cursor'); }
+      requireValue(cursor && !Number.isNaN(Date.parse(cursor.date)) && /^[0-9a-f-]{36}$/i.test(cursor.id),'Invalid page cursor');
+    }
+    const values=[`%${term}%`,kind,cursor?.date??null,cursor?.id??null];
+    const where=`c.audience='public' and c.status='available' and l.active=true and p.visibility='public'
+      and ($1='' or w.title ilike $1 or w.author ilike $1 or p.handle ilike $1)
+      and ($2='all' or l.kind=$2)`;
+    const [copyRows,rooms,circles,copyCount,readers]=await Promise.all([
       many(`select c.id,c.condition,c.condition_notes,c.special_features,c.status,c.owner_id,c.created_at,
         w.title,w.author,e.isbn,e.format,e.language,l.kind,l.terms,l.acceptable,l.shipping_allowed,
         p.handle,p.display_name,p.city,
         (select id from copy_photos ph where ph.copy_id=c.id and ph.kind='front' order by created_at limit 1) as front_photo
         from copies c join editions e on e.id=c.edition_id join works w on w.id=e.work_id
         join listings l on l.copy_id=c.id join profiles p on p.id=c.owner_id
-        where c.audience='public' and c.status='available' and l.active=true and p.visibility='public'
-        order by c.created_at desc limit 150`),
+        where ${where} and ($3::timestamptz is null or (c.created_at,c.id)<($3::timestamptz,$4::uuid))
+        order by c.created_at desc,c.id desc limit 31`,[term?values[0]:'',...values.slice(1)]),
       many(`select r.id,r.name,r.mood,r.version,p.id as user_id,p.handle,p.display_name from rooms r join profiles p on p.id=r.user_id where r.audience='public' and p.visibility='public' order by r.updated_at desc limit 30`),
       many(`select c.id,c.name,c.description,c.current_title,p.handle as host from circles c join profiles p on p.id=c.host_id where c.audience='public' order by c.created_at desc limit 30`),
-      one<{copies:string,readers:string}>(`select (select count(*)::text from copies where status='available' and audience='public') as copies,(select count(*)::text from profiles where visibility='public') as readers`)
+      one<{copies:string}>(`select count(*)::text as copies from copies c join editions e on e.id=c.edition_id join works w on w.id=e.work_id join listings l on l.copy_id=c.id join profiles p on p.id=c.owner_id where ${where}`,[term?values[0]:'',kind]),
+      one<{readers:string}>(`select count(*)::text as readers from profiles where visibility='public'`)
     ]);
-    return {copies,rooms,circles,counts};
+    const copies=copyRows.slice(0,30),last=copies.at(-1);
+    const nextCursor=copyRows.length>30 && last?Buffer.from(JSON.stringify({date:last.created_at,id:last.id})).toString('base64url'):null;
+    return {copies:discovery.publicListingsEnabled?copies:[],rooms:discovery.publicRoomsEnabled?rooms:[],circles,counts:{copies:discovery.publicListingsEnabled?copyCount?.copies??'0':'0',readers:readers?.readers??'0'},nextCursor:discovery.publicListingsEnabled?nextCursor:null,serviceNotice:notices.message};
   }
   if(scope==='me') {
     mine();
-    const [profile,copies,wishlist,reads,offers,loans,room,binders,circles,ledger,cases,messages,roles] = await Promise.all([
+    const [profile,copies,wishlist,reads,offers,loans,room,roomHistory,binders,circles,ledger,accountBalances,cases,messages,roles] = await Promise.all([
       one('select * from profiles where id=$1',[user]),
       many(`select c.*,w.title,w.author,e.isbn,e.format,l.kind,l.terms,l.acceptable,l.active,l.shipping_allowed,
         (select id from copy_photos ph where ph.copy_id=c.id and ph.kind='front' order by created_at limit 1) as front_photo
@@ -37,9 +59,11 @@ export async function view(scope:string,user:string|null,query:URLSearchParams) 
         where o.proposer_id=$1 or o.recipient_id=$1 order by o.updated_at desc`,[user]),
       many(`select l.*,w.title from loans l join copies c on c.id=l.copy_id join editions e on e.id=c.edition_id join works w on w.id=e.work_id where l.owner_id=$1 or l.borrower_id=$1 order by l.id desc`,[user]),
       one('select * from rooms where user_id=$1',[user]),
+      many('select v.version,v.created_at,v.name,v.mood from room_draft_versions v join rooms r on r.id=v.room_id where r.user_id=$1 order by v.version desc limit 20',[user]),
       many(`select b.*,(select coalesce(json_agg(bc.copy_id),'[]'::json) from binder_copies bc where bc.binder_id=b.id) as copies from binders b where b.user_id=$1 order by position,name`,[user]),
       many(`select c.* from circles c join circle_members m on m.circle_id=c.id where m.user_id=$1 order by c.created_at desc`,[user]),
       many(`select j.id,j.event_key,j.source,j.created_at,a.kind,p.amount from leaflet_postings p join leaflet_accounts a on a.id=p.account_id join leaflet_journals j on j.id=p.journal_id where a.user_id=$1 order by j.created_at desc limit 100`,[user]),
+      many<{kind:string;amount:string}>(`select a.kind,coalesce(sum(p.amount),0)::text as amount from leaflet_accounts a left join leaflet_postings p on p.account_id=a.id where a.user_id=$1 group by a.kind`,[user]),
       many('select * from cases where reporter_id=$1 order by created_at desc',[user]),
       many(`select m.*,p.handle as other_handle from messages m join profiles p on p.id=case when m.sender_id=$1 then m.recipient_id else m.sender_id end where m.sender_id=$1 or m.recipient_id=$1 order by m.created_at desc limit 100`,[user]),
       many<{role:string}>('select role from staff_roles where user_id=$1',[user])
@@ -50,35 +74,43 @@ export async function view(scope:string,user:string|null,query:URLSearchParams) 
       many(`select l.*,w.title from loans l join copies c on c.id=l.copy_id join editions e on e.id=c.edition_id join works w on w.id=e.work_id where l.borrower_id=$1 and l.return_status='returned'`,[user])
     ]);
     const balances = {available:0,pending:0,held:0,spent:0};
-    for(const entry of ledger as {kind:keyof typeof balances;amount:number}[]) balances[entry.kind]=(balances[entry.kind]??0)+entry.amount;
-    return {profile,copies,wishlist,reads,offers,loans,room,binders,circles,ledger,balances,cases,messages,roles:roles.map((r:{role:string})=>r.role),ghost,history};
+    for(const entry of accountBalances) if(entry.kind in balances) balances[entry.kind as keyof typeof balances]=Number(entry.amount);
+    return {profile,copies,wishlist,reads,offers,loans,room,roomHistory,binders,circles,ledger,balances,cases,messages,roles:roles.map((r:{role:string})=>r.role),ghost,history};
+  }
+  if(scope==='ledger') {
+    mine();
+    const before=query.get('before');
+    if(before) requireValue(/^\d+$/.test(before),'Invalid statement cursor');
+    const rows=await many(`select p.id,j.event_key,j.source,j.created_at,a.kind,p.amount from leaflet_postings p join leaflet_accounts a on a.id=p.account_id join leaflet_journals j on j.id=p.journal_id where a.user_id=$1 and ($2::bigint is null or p.id<$2::bigint) order by p.id desc limit 51`,[user,before??null]);
+    return {entries:rows.slice(0,50),nextCursor:rows.length>50?String(rows[49].id):null};
   }
   if(scope==='copy') {
     const copyId=query.get('id');requireValue(copyId,'Copy ID required');
-    const copy=await one(`select c.*,w.title,w.author,e.isbn,e.format,e.language,e.publisher,l.kind,l.terms,l.acceptable,l.shipping_allowed,l.active,p.handle,p.display_name,p.city
+    const copy=await one(`select c.*,w.title,w.author,e.isbn,e.format,e.language,e.publisher,l.kind,l.terms,l.acceptable,l.shipping_allowed,l.active,p.handle,p.display_name,p.city,p.visibility as profile_visibility
       from copies c join editions e on e.id=c.edition_id join works w on w.id=e.work_id left join listings l on l.copy_id=c.id join profiles p on p.id=c.owner_id where c.id=$1`,[copyId]);
     requireValue(copy,'Copy not found',404);
     const connected=user?await one('select 1 from offer_items i join offers o on o.id=i.offer_id where i.copy_id=$1 and (o.proposer_id=$2 or o.recipient_id=$2) limit 1',[copyId,user]):null;
     const participant=Boolean(user && (copy.owner_id===user||copy.holder_id===user||connected));
-    const visible=copy.audience==='public' && (copy.active || copy.status==='available');
+    const visible=copy.audience==='public' && copy.profile_visibility==='public' && copy.active && copy.status==='available';
     requireValue(participant||visible,'Copy is private',403);
     const [events,photos,notes]=await Promise.all([
       many(`select event_type,public_summary,created_at${participant?',detail,actor_id,transaction_id':''} from passport_events where copy_id=$1 ${participant?'':'and public_summary is not null'} order by id desc`,[copyId]),
-      many('select id,kind,caption,storage_path from copy_photos where copy_id=$1 order by created_at',[copyId]),
+      many('select id,kind,caption from copy_photos where copy_id=$1 order by created_at',[copyId]),
       many(`select n.id,n.body,n.spoiler,n.created_at,p.handle from journey_notes n join profiles p on p.id=n.author_id where n.copy_id=$1 and n.withdrawn_at is null and (n.audience='public' or n.author_id=$2) order by n.created_at desc`,[copyId,user])
     ]);
-    return {copy,events,photos,notes};
+    const publicCopy={id:copy.id,condition:copy.condition,condition_notes:copy.condition_notes,special_features:copy.special_features,status:copy.status,owner_id:copy.owner_id,title:copy.title,author:copy.author,isbn:copy.isbn,format:copy.format,language:copy.language,publisher:copy.publisher,kind:copy.kind,terms:copy.terms,acceptable:copy.acceptable,shipping_allowed:copy.shipping_allowed,active:copy.active,handle:copy.handle,display_name:copy.display_name,city:copy.city};
+    return {copy:participant?copy:publicCopy,events,photos,notes};
   }
   if(scope==='room') {
     const handle=query.get('handle');requireValue(handle,'Reader handle required');
     const room=await one(`select r.*,p.handle,p.display_name,p.id as owner_id from rooms r join profiles p on p.id=r.user_id where p.handle=$1`,[handle]);
-    requireValue(room && (room.owner_id===user || room.audience==='public'),'Room not found',404);
+    requireValue(room && (room.owner_id===user || (room.audience==='public' && room.published && await one('select 1 from profiles where id=$1 and visibility=$2',[room.owner_id,'public']))),'Room not found',404);
     const owner=room.owner_id===user;
     const scene=owner ? room.draft : room.published;
     const ids=((scene as {objects?:{copyId?:string}[]})?.objects??[]).map(o=>o.copyId).filter(Boolean);
-    const books=ids.length?await many(`select c.id,c.status,c.owner_id,w.title,w.author,c.condition,l.kind,l.active from copies c join editions e on e.id=c.edition_id join works w on w.id=e.work_id left join listings l on l.copy_id=c.id where c.id=any($1::uuid[]) and ($2::boolean or (c.audience='public' and c.status='available' and l.active))`,[ids,owner]):[];
+    const books=ids.length?await many(`select c.id,c.status,c.owner_id,w.title,w.author,c.condition,l.kind,l.active,(select id from copy_photos ph where ph.copy_id=c.id and ph.kind='front' order by created_at limit 1) as front_photo from copies c join editions e on e.id=c.edition_id join works w on w.id=e.work_id left join listings l on l.copy_id=c.id where c.id=any($1::uuid[]) and (c.owner_id=$3 or c.holder_id=$3) and ($2::boolean or (c.audience='public' and c.status='available' and l.active))`,[ids,owner,room.owner_id]):[];
     const allowed=new Set(books.map(b=>String(b.id)));
-    const safeScene=owner?scene:{...scene,objects:(scene?.objects??[]).filter((o:{copyId?:string})=>!o.copyId||allowed.has(o.copyId))};
+    const safeScene={...scene,objects:(scene?.objects??[]).filter((o:{copyId?:string})=>!o.copyId||allowed.has(o.copyId))};
     return {room:{id:room.id,name:room.name,mood:room.mood,version:room.version,handle:room.handle,display_name:room.display_name,audience:room.audience},scene:safeScene,books};
   }
   if(scope==='circle') {
