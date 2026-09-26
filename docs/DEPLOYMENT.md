@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - A dedicated Supabase project in the user's chosen organization. Enable email OTP, add allowed callback URLs and copy project URL and publishable key.
-- Use a direct or transaction-pooler Postgres URL with credentials held only in Vercel environment variables. Apply the migrations in order. Private `copy-evidence` Storage bucket is created by migration 002.
+- Use the Supabase transaction-pooler Postgres URL for Vercel, with credentials held only in Vercel environment variables. The server verifies the pooler's TLS certificate against the Supabase Root 2021 CA bundled in `src/lib/supabase-ca.ts`; review that trust anchor before its April 2031 expiry or after Supabase announces rotation. Apply the migrations in order. Private `copy-evidence` Storage bucket is created by migration 002.
 - Set `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, `DATABASE_URL`, and `SUPABASE_SECRET_KEY` in Vercel Production and Preview environments. Do not expose the database URL or secret key with a `NEXT_PUBLIC_` prefix.
 - Build command `npm run build`; framework preset Next.js; install command `npm ci`; Node 20.9 or later. No rewrite rule is needed for App Router.
 

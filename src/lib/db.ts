@@ -1,13 +1,14 @@
 import 'server-only';
 import pg, { type PoolClient, type QueryResultRow } from 'pg';
+import { supabaseRootCa } from './supabase-ca';
 
 const globalPool = globalThis as typeof globalThis & { bookbondsPool?: pg.Pool };
 export function databaseConfigured() { return Boolean(process.env.DATABASE_URL); }
 export function db() {
   if (!process.env.DATABASE_URL) throw new Error('Database is not configured');
   if (!globalPool.bookbondsPool) globalPool.bookbondsPool = new pg.Pool({
-    connectionString: process.env.DATABASE_URL, max: 5, idleTimeoutMillis: 30000,
-    ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: true }
+    connectionString: process.env.DATABASE_URL, max: 1, idleTimeoutMillis: 30000,
+    ssl: process.env.DATABASE_URL.includes('localhost') ? false : { ca: supabaseRootCa, rejectUnauthorized: true }
   });
   return globalPool.bookbondsPool;
 }
