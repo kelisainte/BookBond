@@ -2,6 +2,8 @@ import { transaction, audit, type Tx } from './db';
 import { DomainError, requireValue, short, note, uuid } from './validation';
 import { postBalanced } from './ledger';
 import { z } from 'zod';
+import { offerKindForListing, type ListingKind } from './offer-kind';
+import {effectivePolicy,validatePolicy, type PolicyKey} from './policies';
 
 type Body = Record<string, unknown>;
 const text = (value:unknown) => short.parse(value);
@@ -59,7 +61,7 @@ export async function command(action:string, payload:Body, user:string) {
       const progress=payload.progress === '' || payload.progress == null ? null : z.coerce.number().int().min(0).max(100).parse(payload.progress);
       const {rows}=await tx.query(`insert into reading_entries(id,user_id,title,author,status,progress,note,audience,finished_at)
         values(coalesce($1,gen_random_uuid()),$2,$3,$4,$5,$6,$7,$8,case when $5='finished' then now() else null end)
-        on conflict(id) do update set status=excluded.status,progress=excluded.progress,note=excluded.note,audience=excluded.audience,finished_at=case when excluded.status='finished' then coalesce(reading_entries.finished_at,now()) else null end,updated_at=now()
+        on conflict(id) do update set title=excluded.title,author=excluded.author,status=excluded.status,progress=excluded.progress,note=excluded.note,audience=excluded.audience,finished_at=case when excluded.status='finished' then coalesce(reading_entries.finished_at,now()) else null end,updated_at=now()
         where reading_entries.user_id=$2 returning *`,[rowId,user,text(payload.title),String(payload.author??'').slice(0,180),status,progress,details(payload.note),enumValue(payload.audience??'private',['private','public'] as const)]);
       requireValue(rows[0],'Reading entry not found',404);return rows[0];
     }
@@ -78,6 +80,7 @@ export async function command(action:string, payload:Body, user:string) {
       await audit(tx,user,action,'copy',rows[0].id);return rows[0];
     }
     if (action === 'listing.save') {
+      requireValue((await effectivePolicy(tx,'feature_flags')).listingsEnabled,'New listing changes are temporarily paused',409);
       const copyId=id(payload.copyId);
       const {rows:[copy]}=await tx.query('select * from copies where id=$1 for update',[copyId]);
       requireValue(copy && copy.owner_id===user && copy.holder_id===user,'Only the owner holding this copy can list it',403);
@@ -93,7 +96,9 @@ export async function command(action:string, payload:Body, user:string) {
       return rows[0];
     }
     if (action === 'offer.create') {
-      const recipient=id(payload.recipientId), kind=enumValue(payload.kind,['bond','gift','loan'] as const);
+      requireValue((await effectivePolicy(tx,'feature_flags')).offersEnabled,'New offers are temporarily paused',409);
+      const recipient=id(payload.recipientId), requestedKind=enumValue(payload.kind,['swap','bond','loan','gift'] as const);
+      const kind=requestedKind==='bond'?'bond':offerKindForListing(requestedKind as ListingKind);
       requireValue(recipient!==user,'Choose another reader');
       const copyIds=z.array(uuid).min(1).max(8).parse(payload.copyIds);
       requireValue(new Set(copyIds).size===copyIds.length,'A copy can appear only once');
@@ -222,19 +227,38 @@ export async function command(action:string, payload:Body, user:string) {
     if (action === 'room.save' || action === 'room.publish') {
       const {rows:[room]}=await tx.query('select * from rooms where user_id=$1 for update',[user]);requireValue(room,'Room not found',404);
       if(action==='room.save') {
+        const baseVersion=z.number().int().min(0).parse(payload.baseVersion);
+        requireValue(room.draft_version===baseVersion,'Room changed in another tab. Your unsaved draft is still here; export it before reloading.',409);
         const scene=z.object({light:z.number().min(0).max(100),objects:z.array(z.object({id:z.string().max(80),type:z.enum(['shelf','chair','plant','lamp','art','book']),x:z.number().min(0).max(100),y:z.number().min(0).max(100),rotation:z.number().min(-180).max(180),scale:z.number().min(0.5).max(2).optional(),color:z.string().regex(/^#[0-9a-fA-F]{6}$/),copyId:z.uuid().optional()})).max(80)}).parse(payload.scene);
         const copyIds=scene.objects.filter(o=>o.copyId).map(o=>o.copyId);
         if(copyIds.length) {
           const {rows:allowed}=await tx.query('select id from copies where id=any($1::uuid[]) and (owner_id=$2 or holder_id=$2)',[copyIds,user]);
           requireValue(allowed.length===new Set(copyIds).size,'A Room book must be yours or borrowed by you',403);
         }
-        await tx.query('update rooms set draft=$2,name=$3,mood=$4,updated_at=now() where user_id=$1',[user,JSON.stringify(scene),text(payload.name),enumValue(payload.mood,['study','sunroom','archive','afterhours'] as const)]);
-        return {saved:true};
+        const {rows}=await tx.query('update rooms set draft=$2,name=$3,mood=$4,draft_version=draft_version+1,updated_at=now() where user_id=$1 returning draft_version',[user,JSON.stringify(scene),text(payload.name),enumValue(payload.mood,['study','sunroom','archive','afterhours'] as const)]);
+        await tx.query('insert into room_draft_versions(room_id,version,scene,name,mood) values($1,$2,$3,$4,$5)',[room.id,rows[0].draft_version,JSON.stringify(scene),text(payload.name),enumValue(payload.mood,['study','sunroom','archive','afterhours'] as const)]);
+        return {saved:true,draftVersion:rows[0].draft_version};
       }
+      requireValue((await effectivePolicy(tx,'feature_flags')).roomPublishingEnabled,'Room publishing is temporarily paused',409);
+      requireValue(room.draft_version===z.number().int().min(0).parse(payload.baseVersion),'Room changed before publication. Review the latest draft.',409);
       const audience=enumValue(payload.audience,['public','private'] as const);
       const {rows}=await tx.query('update rooms set published=draft,audience=$2,version=version+1,updated_at=now() where user_id=$1 returning *',[user,audience]);
       await tx.query('insert into room_versions(room_id,version,scene) values($1,$2,$3)',[room.id,rows[0].version,JSON.stringify(room.draft)]);
       await audit(tx,user,action,'room',room.id,{version:rows[0].version,audience});return {version:rows[0].version};
+    }
+    if(action==='room.restore') {
+      const baseVersion=z.number().int().min(0).parse(payload.baseVersion);
+      const version=z.number().int().positive().parse(payload.version);
+      const {rows:[room]}=await tx.query('select * from rooms where user_id=$1 for update',[user]);
+      requireValue(room,'Room not found',404);
+      requireValue(room.draft_version===baseVersion,'Room changed in another tab. Reload before restoring.',409);
+      const {rows:[saved]}=await tx.query('select scene,name,mood from room_draft_versions where room_id=$1 and version=$2',[room.id,version]);
+      requireValue(saved,'Draft revision not found',404);
+      const nextVersion=room.draft_version+1;
+      await tx.query('update rooms set draft=$2,name=$3,mood=$4,draft_version=$5,updated_at=now() where id=$1',[room.id,saved.scene,saved.name,saved.mood,nextVersion]);
+      await tx.query('insert into room_draft_versions(room_id,version,scene,name,mood) values($1,$2,$3,$4,$5)',[room.id,nextVersion,saved.scene,saved.name,saved.mood]);
+      await audit(tx,user,action,'room',room.id,{fromVersion:version,toVersion:nextVersion});
+      return {draftVersion:nextVersion,scene:saved.scene,name:saved.name,mood:saved.mood};
     }
     if(action==='binder.create') {
       const {rows}=await tx.query('insert into binders(user_id,name,audience) values($1,$2,$3) returning *',[user,text(payload.name),enumValue(payload.audience??'private',['private','public'] as const)]);return rows[0];
@@ -283,9 +307,9 @@ export async function command(action:string, payload:Body, user:string) {
       const roleSet=new Set(roles.map(r=>r.role));
       if(action==='admin.policy') {
         requireValue(roleSet.has('owner')||roleSet.has('security'),'Insufficient role',403);
-        const key=z.enum(['feature_flags','discovery','service_notices']).parse(payload.key), value=payload.value;
+        const key=z.enum(['feature_flags','discovery','service_notices']).parse(payload.key) as PolicyKey;
         requireValue(details(payload.reason).length>=10,'Explain the reason for this change');
-        requireValue(typeof value==='object'&&value!==null,'Policy value must be an object');
+        const value=validatePolicy(key,payload.value);
         const {rows}=await tx.query('insert into policies(key,value,updated_by) values($1,$2,$3) on conflict(key) do update set value=excluded.value,version=policies.version+1,updated_by=excluded.updated_by,updated_at=now() returning *',[key,JSON.stringify(value),user]);
         await audit(tx,user,action,'policy',key,{version:rows[0].version},details(payload.reason));return rows[0];
       }

@@ -6,4 +6,5 @@ node_modules
 coverage
 .vercel
 .snapshots
+.change-history/
 tsconfig.tsbuildinfo
